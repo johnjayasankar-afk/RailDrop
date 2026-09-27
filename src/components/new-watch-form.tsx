@@ -10,11 +10,21 @@ import { stationLabel } from "@/lib/stations/catalog";
 import type { WatchFormInitial } from "@/lib/domain/watch-query";
 import { RouteRibbon } from "@/components/route-ribbon";
 import { Flap } from "@/components/flap";
+import { UnsavedFares } from "@/components/unsaved-fares";
+import type { FarePreview } from "@/lib/watches/preview-fares";
 import { changeRuleNote } from "@/lib/domain/board-moves";
 
 const LAST_ROUTE = "raildrop.lastRoute";
 
-export function NewWatchForm({ email, initial }: { email: string; initial?: WatchFormInitial }) {
+export function NewWatchForm({
+  email,
+  isGuest = false,
+  initial,
+}: {
+  email: string;
+  isGuest?: boolean;
+  initial?: WatchFormInitial;
+}) {
   const router = useRouter();
   const today = useMemo(() => new Date().toISOString().slice(0, 10), []);
   const defaultDate = useMemo(() => {
@@ -37,6 +47,16 @@ export function NewWatchForm({ email, initial }: { email: string; initial?: Watc
   const [threshold, setThreshold] = useState("1");
   const [alertEmail, setAlertEmail] = useState("");
   const [error, setError] = useState<string | null>(null);
+  /**
+   * Fares we found when we could not save the watch.
+   *
+   * The product's promise is "here are the live Amtrak fares for your trip",
+   * and it does not need a database to keep it. But every path to a price went
+   * through creating a watch first, so when the database behind a deployment
+   * went away the app could not show anybody a single fare — while the scraper
+   * was working perfectly the whole time.
+   */
+  const [unsaved, setUnsaved] = useState<FarePreview | null>(null);
   const [busy, setBusy] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const abortRef = useRef<AbortController | null>(null);
@@ -113,11 +133,43 @@ export function NewWatchForm({ email, initial }: { email: string; initial?: Watc
       router.push(`/watches/${json.watch.id}`);
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") {
-        setError("Scan dismissed — create again when you are ready.");
+        setError("Scan dismissed: create again when you are ready.");
         setBusy(false);
         return;
       }
-      setError(err instanceof Error ? err.message : "Could not create watch");
+      const message = err instanceof Error ? err.message : "Could not create watch";
+      setError(message);
+
+      /* We could not save it. We can still answer the question.
+       *
+       * Only for a failure that is ours — a database we could not reach. A
+       * rejected date or a bad station code is the form's problem and showing
+       * fares underneath it would be answering a different question than the
+       * one that failed. */
+      if (/could not reach|try again in a minute/i.test(message)) {
+        try {
+          const response = await fetch("/api/fares", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              originCode: origin,
+              destinationCode: destination,
+              desiredTravelDate: date,
+              dateFlexibilityDays: flexibility,
+              passengerCount: passengers,
+              includeRestrictedFares: restricted,
+              includeThruway,
+              timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "America/New_York",
+            }),
+          });
+          const json = await response.json();
+          if (response.ok && json.preview) setUnsaved(json.preview as FarePreview);
+        } catch {
+          // The fallback failing changes nothing: the error above already says
+          // what happened, and a second message about a second failure helps
+          // nobody.
+        }
+      }
       setBusy(false);
     } finally {
       if (abortRef.current === controller) abortRef.current = null;
@@ -344,15 +396,21 @@ export function NewWatchForm({ email, initial }: { email: string; initial?: Watc
                   value={alertEmail}
                   onChange={(event) => setAlertEmail(event.target.value)}
                   className="field"
-                  placeholder={email}
+                  placeholder={email || "you@email.com"}
                 />
               </label>
+              <p className="text-xs text-ink-soft">
+                {isGuest
+                  ? "Leave blank to watch prices on this device only. Add an email if you want fare-drop alerts."
+                  : "Leave blank to skip email alerts. We’ll use this address when a listed fare drops."}
+              </p>
             </section>
             {error ? (
               <p className="text-sm text-danger" role="alert">
                 {error}
               </p>
             ) : null}
+            {unsaved ? <UnsavedFares preview={unsaved} /> : null}
             <button disabled={busy} className="btn btn-primary w-full py-3">
               {busy ? "Checking your window…" : "Start watching"}
             </button>

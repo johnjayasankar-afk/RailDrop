@@ -6,7 +6,7 @@ import { logger } from "@/lib/logger";
 import { withRetry } from "./retry";
 import { normalizeWanderuTrips, type WanderuTrip } from "./wanderu-normalizer";
 import { wanderuSearchLabel } from "./wanderu-station-map";
-import { launchChromium, sanitizeProviderError } from "./playwright-launch";
+import { isServerlessRuntime, launchChromium, sanitizeProviderError } from "./playwright-launch";
 
 type PlaywrightBrowser = {
   isConnected?: () => boolean;
@@ -33,11 +33,48 @@ type PlaywrightResponse = {
   json: () => Promise<unknown>;
 };
 
-const MAX_CONCURRENT_PAGES = 3;
+/* How many Wanderu pages may be open at once.
+ *
+ * Measured rather than reasoned about, because reasoning about it was wrong.
+ * A single slow cycle looked like contention — three searches at 41s where two
+ * had taken 8.5s — and the obvious inference was that three headless pages
+ * starve each other. Repeating it said otherwise. Wall clock for a five-date
+ * BOS→NYP window, medians of three runs:
+ *
+ *     1 page  ~22s      3 pages ~15s
+ *     2 pages ~18s      4 pages ~28s
+ *
+ * Three is the best of them and four falls off a cliff — that is where the
+ * contention actually starts. The 41s run was the live site having a bad
+ * minute, and run-to-run variance (12s to 29s at the same setting) is wide
+ * enough to swallow any difference between 1, 2 and 3. Do not re-tune this from
+ * one observation; it is what produced the wrong answer the first time.
+ *
+ * Serverless stays at 1 for memory, not speed: a Lambda has a fraction of the
+ * RAM and an OOM costs the whole cycle.
+ *
+ * Overridable because the right number depends on the machine, and an operator
+ * finding this out at 2am should not need a deploy to act on it.
+ */
+const MAX_CONCURRENT_PAGES = readConcurrency();
+
+function readConcurrency(): number {
+  const raw = Number.parseInt(process.env.WANDERU_MAX_PAGES ?? "", 10);
+  // Capped at 4 because 4 is measurably worse; anything above it is not a
+  // setting anyone should reach for by accident.
+  if (Number.isFinite(raw) && raw >= 1 && raw <= 4) return raw;
+  return isServerlessRuntime() ? 1 : 3;
+}
+const PAGE_GOTO_TIMEOUT_MS = isServerlessRuntime() ? 55000 : 45000;
+const TRIP_WAIT_MS = isServerlessRuntime() ? 28000 : 35000;
+const EXTRA_WAIT_MS = isServerlessRuntime() ? 5000 : 8000;
+
 const globalBrowser = globalThis as unknown as {
   __raildropWanderuBrowser?: PlaywrightBrowser | null;
+  __raildropWanderuContext?: PlaywrightContext | null;
   __raildropWanderuActive?: number;
   __raildropWanderuWait?: Array<() => void>;
+  __raildropWanderuPlaces?: Record<string, { pathCity: string; query: string }>;
 };
 
 export class WanderuBrowserProvider implements FareProvider {
@@ -49,9 +86,9 @@ export class WanderuBrowserProvider implements FareProvider {
     try {
       const trips = await this.withSlot(() =>
         withRetry(() => this.fetchTrips(request), {
-          maxAttempts: 3,
-          baseDelayMs: 1200,
-          maxDelayMs: 4000,
+          maxAttempts: isServerlessRuntime() ? 2 : 3,
+          baseDelayMs: 800,
+          maxDelayMs: 2500,
           retryable: (error) => isRetryableWanderuError(error),
         }),
       );
@@ -83,7 +120,7 @@ export class WanderuBrowserProvider implements FareProvider {
         wanderuTrips: trips.length,
         journeys: journeys.length,
         latencyMs: metadata.latencyMs,
-        source: "wanderu-browser",
+        source: isServerlessRuntime() ? "wanderu-serverless" : "wanderu-browser",
       });
       return {
         request,
@@ -102,7 +139,7 @@ export class WanderuBrowserProvider implements FareProvider {
         retryable: true,
         message: raw,
         userMessage: message,
-        source: "wanderu-browser",
+        source: isServerlessRuntime() ? "wanderu-serverless" : "wanderu-browser",
       });
       return {
         request,
@@ -137,7 +174,9 @@ export class WanderuBrowserProvider implements FareProvider {
       await this.browser();
       return {
         ok: true,
-        message: "Wanderu browser fare provider ready",
+        message: isServerlessRuntime()
+          ? "Wanderu serverless Chromium ready"
+          : "Wanderu browser fare provider ready",
         latencyMs: Date.now() - started,
       };
     } catch (error) {
@@ -180,20 +219,8 @@ export class WanderuBrowserProvider implements FareProvider {
   }
 
   private async fetchTrips(request: FareSearchRequest): Promise<WanderuTrip[]> {
-    const origin = wanderuSearchLabel(request.originCode);
-    const destination = wanderuSearchLabel(request.destinationCode);
-    const url = `https://www.wanderu.com/en-us/depart/${encodeURIComponent(`${origin.city} ${origin.state}`)}/${encodeURIComponent(`${destination.city} ${destination.state}`)}/${request.travelDate}/`;
-    const browser = await this.browser();
-    const context = await browser.newContext({
-      userAgent:
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-      viewport: { width: 1440, height: 900 },
-      locale: "en-US",
-      timezoneId: "America/New_York",
-      extraHTTPHeaders: {
-        "Accept-Language": "en-US,en;q=0.9",
-      },
-    });
+    const url = this.searchUrl(request);
+    const context = await this.context();
     const page = await context.newPage();
     const intercepted: WanderuTrip[] = [];
     let sawNetworkTrips = false;
@@ -208,9 +235,25 @@ export class WanderuBrowserProvider implements FareProvider {
           resolveNetwork();
         }
       });
+      // Cache place ids from redirects for faster follow-up dates.
+      const responseUrl = response.url();
+      if (responseUrl.includes("/en-us/depart/") && responseUrl.includes("dpid=")) {
+        cachePlacesFromUrl(request.originCode, request.destinationCode, responseUrl);
+      }
     });
     try {
-      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45000 });
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: PAGE_GOTO_TIMEOUT_MS });
+      // Cloudflare challenge pages sometimes appear on datacenter IPs (Vercel).
+      await page
+        .waitForFunction(
+          () => {
+            const title = document.title || "";
+            return !title.toLowerCase().includes("just a moment");
+          },
+          undefined,
+          { timeout: isServerlessRuntime() ? 25000 : 8000 },
+        )
+        .catch(() => undefined);
       await Promise.race([
         page
           .waitForFunction(
@@ -224,20 +267,20 @@ export class WanderuBrowserProvider implements FareProvider {
               return Boolean(trips && Object.keys(trips).length > 0);
             },
             undefined,
-            { timeout: 35000 },
+            { timeout: TRIP_WAIT_MS },
           )
           .catch(() => undefined),
         networkReady,
-        sleep(35000),
+        sleep(TRIP_WAIT_MS),
       ]);
       let fromState = await readInitialState(page);
       let trips = mergeTrips(fromState, intercepted);
       if (trips.length === 0) {
-        await Promise.race([networkReady, sleep(8000)]);
+        await Promise.race([networkReady, sleep(EXTRA_WAIT_MS)]);
         fromState = await readInitialState(page);
         trips = mergeTrips(fromState, intercepted);
       } else if (!sawNetworkTrips) {
-        await sleep(800);
+        await sleep(600);
         trips = mergeTrips(fromState, intercepted);
       }
       if (trips.length === 0) {
@@ -251,8 +294,17 @@ export class WanderuBrowserProvider implements FareProvider {
       throw error;
     } finally {
       await page.close().catch(() => undefined);
-      await context.close().catch(() => undefined);
     }
+  }
+
+  private searchUrl(request: FareSearchRequest): string {
+    const origin = wanderuSearchLabel(request.originCode);
+    const destination = wanderuSearchLabel(request.destinationCode);
+    const cached = globalBrowser.__raildropWanderuPlaces?.[placeCacheKey(request)];
+    if (cached) {
+      return `https://www.wanderu.com${cached.pathCity}/${request.travelDate}/${cached.query}`;
+    }
+    return `https://www.wanderu.com/en-us/depart/${encodeURIComponent(`${origin.city} ${origin.state}`)}/${encodeURIComponent(`${destination.city} ${destination.state}`)}/${request.travelDate}/`;
   }
 
   private async browser(): Promise<PlaywrightBrowser> {
@@ -266,9 +318,31 @@ export class WanderuBrowserProvider implements FareProvider {
     return globalBrowser.__raildropWanderuBrowser;
   }
 
+  private async context(): Promise<PlaywrightContext> {
+    const existing = globalBrowser.__raildropWanderuContext;
+    if (existing && globalBrowser.__raildropWanderuBrowser?.isConnected?.() !== false) {
+      return existing;
+    }
+    const browser = await this.browser();
+    globalBrowser.__raildropWanderuContext = await browser.newContext({
+      userAgent:
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+      viewport: { width: 1440, height: 900 },
+      locale: "en-US",
+      timezoneId: "America/New_York",
+      extraHTTPHeaders: {
+        "Accept-Language": "en-US,en;q=0.9",
+      },
+    });
+    return globalBrowser.__raildropWanderuContext;
+  }
+
   private async resetBrowser(): Promise<void> {
+    const context = globalBrowser.__raildropWanderuContext;
     const current = globalBrowser.__raildropWanderuBrowser;
+    globalBrowser.__raildropWanderuContext = null;
     globalBrowser.__raildropWanderuBrowser = null;
+    await context?.close().catch(() => undefined);
     await current?.close().catch(() => undefined);
   }
 }
@@ -325,6 +399,30 @@ async function capturePsearch(
   }
 }
 
+function placeCacheKey(request: Pick<FareSearchRequest, "originCode" | "destinationCode">): string {
+  return `${request.originCode}:${request.destinationCode}`.toUpperCase();
+}
+
+function cachePlacesFromUrl(originCode: string, destinationCode: string, url: string): void {
+  try {
+    const parsed = new URL(url);
+    const match = parsed.pathname.match(
+      /\/en-us\/depart\/([^/]+)\/([^/]+)\/(\d{4}-\d{2}-\d{2})\/?/,
+    );
+    if (!match) return;
+    const dpid = parsed.searchParams.get("dpid");
+    const opid = parsed.searchParams.get("opid");
+    if (!dpid || !opid) return;
+    globalBrowser.__raildropWanderuPlaces ??= {};
+    globalBrowser.__raildropWanderuPlaces[placeCacheKey({ originCode, destinationCode })] = {
+      pathCity: `/en-us/depart/${match[1]}/${match[2]}`,
+      query: `?dpid=${encodeURIComponent(dpid)}&opid=${encodeURIComponent(opid)}`,
+    };
+  } catch {
+    // ignore malformed URLs
+  }
+}
+
 function isRetryableWanderuError(error: unknown): boolean {
   const message =
     error instanceof Error ? error.message.toLowerCase() : String(error).toLowerCase();
@@ -337,7 +435,9 @@ function isRetryableWanderuError(error: unknown): boolean {
     message.includes("target closed") ||
     message.includes("browser has been closed") ||
     message.includes("executable doesn't exist") ||
-    message.includes("connection")
+    message.includes("connection") ||
+    message.includes("protocol error") ||
+    message.includes("crashed")
   );
 }
 
@@ -349,6 +449,7 @@ function shouldResetBrowser(error: unknown): boolean {
     message.includes("browser has been closed") ||
     message.includes("protocol error") ||
     message.includes("executable doesn't exist") ||
-    message.includes("crashed")
+    message.includes("crashed") ||
+    message.includes("session closed")
   );
 }

@@ -9,6 +9,8 @@ import { runWatchCycle } from "@/lib/orchestration/check-cycle";
 import { isValidTimeZone } from "@/lib/domain/timezone";
 import { generateSearchDates } from "@/lib/domain/calendar";
 import { localIsoDate } from "@/lib/domain/timezone";
+import { logger } from "@/lib/logger";
+import { toAppError } from "@/lib/errors";
 
 export async function createWatchAndScan(input: {
   userId: string;
@@ -18,6 +20,8 @@ export async function createWatchAndScan(input: {
   provider: FareProvider;
   mailer?: Mailer;
   now?: Date;
+  /** Epoch ms after which no new provider search is started. Tests inject it. */
+  searchDeadlineAt?: number;
 }) {
   const parsed: CreateWatchInput = createWatchSchema.parse(input.body);
   if (parsed.originCode === parsed.destinationCode) {
@@ -67,7 +71,7 @@ export async function createWatchAndScan(input: {
     monitorEndAt: monitoring.endAt ? monitoring.endAt.toISOString() : null,
     monitorPreset: parsed.monitorPreset,
     timezone: parsed.timezone,
-    alertEmail: parsed.alertEmail ?? input.email,
+    alertEmail: parsed.alertEmail?.trim() || input.email?.trim() || "",
     status: "ACTIVE",
     lastCheckCycleId: null,
     lastCheckedAt: null,
@@ -76,24 +80,43 @@ export async function createWatchAndScan(input: {
     bestPriceCents: null,
     bestSavingsCents: null,
     lastOpportunity: null,
+    lastAlertedOpportunity: null,
+    opportunityLostNotified: false,
+    departureAlertSent: false,
+    alertImprovementCents: null,
     createdAt: now.toISOString(),
     updatedAt: now.toISOString(),
   };
 
-  await input.repo.upsertProfile({
-    id: input.userId,
-    email: input.email,
-    timezone: parsed.timezone,
-    createdAt: now.toISOString(),
-  });
-  await input.repo.createWatch(watch);
-  const cycle = await runWatchCycle({
-    watch,
-    trigger: "INITIAL",
-    now,
-    repo: input.repo,
-    provider: input.provider,
-    mailer: input.mailer,
-  });
-  return cycle.watch;
+  try {
+    await input.repo.upsertProfile({
+      id: input.userId,
+      email: input.email?.trim() || parsed.alertEmail?.trim() || "guest@raildrop.local",
+      timezone: parsed.timezone,
+      createdAt: now.toISOString(),
+    });
+    await input.repo.createWatch(watch);
+  } catch (error) {
+    throw toAppError(error);
+  }
+
+  // Persist first — never lose the watch if the live scan flakes.
+  try {
+    const cycle = await runWatchCycle({
+      watch,
+      trigger: "INITIAL",
+      now,
+      repo: input.repo,
+      provider: input.provider,
+      mailer: input.mailer,
+      searchDeadlineAt: input.searchDeadlineAt,
+    });
+    return cycle.watch;
+  } catch (error) {
+    logger.error("watch.initial_scan_failed", {
+      watchId: watch.id,
+      message: error instanceof Error ? error.message : String(error),
+    });
+    return watch;
+  }
 }

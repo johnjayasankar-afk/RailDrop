@@ -2,7 +2,7 @@ import Link from "next/link";
 import { PageFrame } from "@/components/page-frame";
 import { WatchList } from "@/components/watch-list";
 import { Flap } from "@/components/flap";
-import { getSessionUser } from "@/lib/auth/session";
+import { getSessionUser, guestEntryHref } from "@/lib/auth/session";
 import { getRepository } from "@/lib/services";
 import { formatUsdCompact } from "@/lib/domain/money";
 import { localIsoDate } from "@/lib/domain/timezone";
@@ -10,13 +10,28 @@ import { watchAttention } from "@/lib/domain/board-act";
 import { soonestWatch } from "@/lib/domain/board-picks";
 import { daysUntilFlap, formatDisplayDate } from "@/lib/domain/calendar";
 import { redirect } from "next/navigation";
+import { loadPageData } from "@/lib/pages/load-guard";
+import { RecordsUnreachable } from "@/components/records-unreachable";
 
 export const dynamic = "force-dynamic";
 
 export default async function DashboardPage() {
   const user = await getSessionUser();
-  if (!user) redirect("/login");
-  const watches = await getRepository().listWatchesForUser(user.id);
+  if (!user) redirect(guestEntryHref("/dashboard"));
+  const loaded = await loadPageData({ page: "/dashboard", userId: user.id }, () =>
+    getRepository().listWatchesForUser(user.id),
+  );
+  if (!loaded.reachable) {
+    return (
+      <PageFrame email={user.email} isGuest={Boolean(user.isGuest)}>
+        <main id="main" className="mx-auto max-w-6xl px-4 py-8">
+          <h1 className="serif text-4xl">Your watches</h1>
+          <RecordsUnreachable what="watches" retryHref="/dashboard" />
+        </main>
+      </PageFrame>
+    );
+  }
+  const watches = loaded.data;
   const ranked = [...watches].sort((a, b) => (b.bestSavingsCents ?? 0) - (a.bestSavingsCents ?? 0));
   const active = watches.filter((watch) => watch.status === "ACTIVE");
   const bestSavings = Math.max(0, ...watches.map((watch) => watch.bestSavingsCents ?? 0));
@@ -30,12 +45,16 @@ export default async function DashboardPage() {
   const next = soonestWatch(watches, today);
 
   return (
-    <PageFrame email={user.email}>
+    <PageFrame email={user.email} isGuest={Boolean(user.isGuest)}>
       <main id="main" className="mx-auto max-w-6xl px-4 py-8">
         <div className="flex flex-wrap items-end justify-between gap-4">
           <div>
             <h1 className="serif text-4xl">Your watches</h1>
-            <p className="text-ink-soft">Trips you already booked.</p>
+            <p className="text-ink-soft">
+              {user.isGuest
+                ? "Browsing as a guest: add an alert email on a trip if you want updates."
+                : "Trips you already booked."}
+            </p>
           </div>
           <Link href="/watches/new" className="btn btn-primary">
             Watch trip
@@ -87,7 +106,7 @@ export default async function DashboardPage() {
             <p className="kicker">Empty board</p>
             <h2 className="serif mt-3 text-3xl">Watch a trip you already booked.</h2>
             <p className="mt-2 max-w-lg text-ink-soft">
-              Enter stations and what you paid — we search your window for a cheaper listed fare.
+              Enter stations and what you paid: we search your window for a cheaper listed fare.
             </p>
             <Link href="/watches/new" className="btn btn-primary mt-6">
               Create first watch

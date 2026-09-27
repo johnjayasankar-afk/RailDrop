@@ -19,8 +19,13 @@ export function SearchingOverlay({
   onCancel?: () => void;
 }) {
   const rootRef = useRef<HTMLDivElement>(null);
+  // Kept in a ref so the Escape listener below never has to re-subscribe, but
+  // written in an effect rather than during render: a ref mutated in the render
+  // body is read by the wrong render when React retries one.
   const cancelRef = useRef(onCancel);
-  cancelRef.current = onCancel;
+  useEffect(() => {
+    cancelRef.current = onCancel;
+  }, [onCancel]);
   const windowLabel = flexibility > 0 ? `${date} ±${flexibility}` : date;
   const progress = Math.min(95, Math.round((elapsedSeconds / 28) * 100));
 
@@ -96,10 +101,10 @@ export function SearchingOverlay({
         </h2>
         <p className="mt-3 text-sm text-ink-soft">
           {elapsedSeconds >= 40
-            ? "Still reading the live board — Wanderu can take a minute on slow days. Stay here, or dismiss and leave the scan running."
+            ? "Still reading the live board. Wanderu can take a minute on slow days. Stay here, or dismiss and leave the scan running."
             : flexibility > 0
-              ? "Live board for your date window. Stay here — this can take about 20–40 seconds."
-              : "This usually takes 15–30 seconds. Stay on this page — we are opening a live fare board, not inventing prices."}
+              ? "Live board for your date window. Stay here: this can take about 20 to 40 seconds."
+              : "This usually takes 15 to 30 seconds. Stay on this page: we are opening a live fare board, not inventing prices."}
         </p>
         <div className="scan-line mt-6">
           <span />

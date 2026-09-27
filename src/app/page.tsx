@@ -16,6 +16,10 @@ const SAMPLE = [
 
 const FAQ = [
   [
+    "Do I need an account?",
+    "No. Watch a trip as a guest. Add an email on the trip only if you want fare-drop alerts. Sign-in is optional.",
+  ],
+  [
     "Do you invent Amtrak prices?",
     "No. If the live board is down, you see that — never a guessed fare. Confirm on Amtrak before you change a ticket.",
   ],
@@ -49,7 +53,7 @@ const FAQ = [
   ],
   [
     "Can I filter by when I need to leave or arrive?",
-    "Yes — leave after, arrive by, duration cap, and a 30-minute arrive buffer. Filters stay on this visit only.",
+    "Yes — leave after, arrive by, duration cap, and a 30-minute arrive buffer. The view lives in the URL, so you can copy it, reload it, or send it to whoever you are travelling with.",
   ],
   [
     "What does Beats your train mean?",
@@ -63,8 +67,9 @@ const FAQ = [
 
 export default async function HomePage() {
   const user = await getSessionUser();
+  const watching = Boolean(user);
   return (
-    <PageFrame email={user?.email}>
+    <PageFrame email={user?.email} isGuest={Boolean(user?.isGuest)}>
       <JsonLd
         data={{
           "@context": "https://schema.org",
@@ -81,14 +86,21 @@ export default async function HomePage() {
         <div className="grid items-end gap-12 lg:grid-cols-[1.15fr_0.85fr]">
           <div className="reveal">
             <p className="kicker">Amtrak fare watch</p>
-            <h1 className="serif mt-4 max-w-3xl text-[2.65rem] leading-[1.05] sm:text-5xl md:text-7xl">
-              Know when your train gets cheaper.
+            <h1 className="serif mt-4 max-w-3xl text-[2.85rem] leading-[1.02] sm:text-5xl md:text-7xl">
+              RailDrop
             </h1>
-            <p className="mt-6 max-w-xl text-lg text-ink-soft">
-              Book the trip. We watch every bookable Amtrak rail option across your window.
+            <p className="serif mt-3 max-w-2xl text-2xl leading-snug text-ink sm:text-3xl md:text-4xl">
+              Know when your train gets cheaper.
+            </p>
+            <p className="mt-5 max-w-xl text-lg text-ink-soft">
+              Book the trip. We watch every bookable Amtrak rail option across your window — and
+              tell you when a listed fare drops.
             </p>
             <div className="mt-10 flex flex-wrap gap-3">
-              <Link href={user ? "/watches/new" : "/login"} className="btn btn-primary">
+              <Link
+                href={watching ? "/watches/new" : "/api/auth/guest?next=%2Fwatches%2Fnew"}
+                className="btn btn-primary"
+              >
                 Watch a booked trip
               </Link>
               <Link href="/login" className="btn btn-ghost">
@@ -96,7 +108,7 @@ export default async function HomePage() {
               </Link>
             </div>
             <p className="mt-5 text-xs uppercase tracking-[0.16em] text-ink-soft">
-              Live listed fares · no invented prices · one precise alert
+              No account required · email alerts optional · no invented prices
             </p>
           </div>
           <section className="ticket reveal" style={{ animationDelay: "80ms" }}>
@@ -141,16 +153,15 @@ export default async function HomePage() {
           </section>
         </div>
 
-        <section className="mt-16 grid grid-cols-2 gap-3 md:grid-cols-4">
+        <section className="mt-16 grid grid-cols-1 gap-3 sm:grid-cols-3">
           {[
-            ["Live", "On-demand board"],
-            ["±1 day", "Default window"],
-            ["3× / day", "While watching"],
-            ["$0 fake", "Never invented"],
+            ["Live board", "On-demand listed fares"],
+            ["±1 day", "Default search window"],
+            ["Honest", "Never invent a price"],
           ].map(([value, label], index) => (
             <div
               key={label}
-              className="panel reveal px-3 py-4 sm:px-4"
+              className="panel reveal px-4 py-4"
               style={{ animationDelay: `${90 + index * 50}ms` }}
             >
               <p className="serif text-xl sm:text-2xl">{value}</p>
@@ -220,6 +231,19 @@ export default async function HomePage() {
               </details>
             ))}
           </div>
+        </section>
+
+        <section className="ticket mt-16 p-8 text-center">
+          <p className="serif text-3xl md:text-4xl">RailDrop</p>
+          <p className="mx-auto mt-3 max-w-md text-ink-soft">
+            Book the trip. We watch the board. You decide on Amtrak.
+          </p>
+          <Link
+            href={watching ? "/watches/new" : "/api/auth/guest?next=%2Fwatches%2Fnew"}
+            className="btn btn-primary mt-6"
+          >
+            Watch a booked trip
+          </Link>
         </section>
       </main>
     </PageFrame>

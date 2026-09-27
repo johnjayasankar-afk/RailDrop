@@ -1,25 +1,41 @@
 import { redirect } from "next/navigation";
 import { PageFrame } from "@/components/page-frame";
-import { getSessionUser } from "@/lib/auth/session";
+import { getSessionUser, guestEntryHref } from "@/lib/auth/session";
 import { getConfig } from "@/lib/config";
 import { getRepository } from "@/lib/services";
+import { loadPageData } from "@/lib/pages/load-guard";
 import { fareProviderStatus } from "@/lib/providers/create-provider";
 import { ConnectLiveFares } from "@/components/connect-live-fares";
 import { Flap } from "@/components/flap";
+import Link from "next/link";
 
 export const dynamic = "force-dynamic";
 
 export default async function SettingsPage() {
   const user = await getSessionUser();
-  if (!user) redirect("/login");
+  if (!user) redirect(guestEntryHref("/settings"));
   const config = getConfig();
-  const usage = await getRepository().getUsage(new Date().toISOString().slice(0, 10));
+  /* The usage figures are the only thing here that needs the database, and
+   * everything else on the page — the provider status, the keyboard help, the
+   * honest-limits note — is worth reading without them. So this degrades to one
+   * dead panel rather than losing the page, which is what an unguarded read
+   * did: the whole of Settings became "The board could not load".
+   *
+   * When the figures cannot be read they show as "—", not as 0. Zero credits is
+   * a claim that nothing has been spent today, and we do not know that. It is
+   * the same rule as the fares: never state a number we did not observe. */
+  const loadedUsage = await loadPageData({ page: "/settings", userId: user.id }, () =>
+    getRepository().getUsage(new Date().toISOString().slice(0, 10)),
+  );
+  const usage = loadedUsage.reachable ? loadedUsage.data : null;
+  const usageReadable = loadedUsage.reachable;
   const provider = fareProviderStatus();
   const projected = (usage?.credits ?? 0) * 30;
   const overBudget = projected > config.providerMonthlyCreditBudget;
+  const count = (value: number | undefined) => (usageReadable ? String(value ?? 0) : "\u2014");
 
   return (
-    <PageFrame email={user.email}>
+    <PageFrame email={user.email} isGuest={Boolean(user.isGuest)}>
       <main id="main" className="mx-auto max-w-2xl px-4 py-8">
         <div className="depart-strip">
           <Flap>SET</Flap>
@@ -27,7 +43,19 @@ export default async function SettingsPage() {
           <Flap>FARES</Flap>
         </div>
         <h1 className="serif mt-6 text-4xl">Settings</h1>
-        <p className="mt-2 text-ink-soft">{user.email}</p>
+        <p className="mt-2 text-ink-soft">
+          {user.isGuest
+            ? "Guest session: sign in only if you want an account. Alerts use the email on each watch."
+            : user.email}
+        </p>
+        {user.isGuest ? (
+          <p className="mt-4 text-sm">
+            <Link href="/login" className="text-ink underline">
+              Sign in with email
+            </Link>{" "}
+            (optional)
+          </p>
+        ) : null}
         {config.isLocal ? <ConnectLiveFares live={Boolean(config.parseApiKey)} /> : null}
         <section className="panel mt-8 p-5 text-sm">
           <h2 className="text-xs uppercase tracking-[0.16em] text-ink-soft">Provider usage</h2>
@@ -35,7 +63,7 @@ export default async function SettingsPage() {
             <div>
               <dt className="text-xs uppercase tracking-[0.14em] text-ink-soft">Credits today</dt>
               <dd className="serif text-2xl">
-                <Flap>{String(usage?.credits ?? 0)}</Flap>
+                <Flap>{count(usage?.credits)}</Flap>
               </dd>
             </div>
             <div>
@@ -43,13 +71,13 @@ export default async function SettingsPage() {
                 Successful searches
               </dt>
               <dd className="serif text-2xl">
-                <Flap>{String(usage?.successes ?? 0)}</Flap>
+                <Flap>{count(usage?.successes)}</Flap>
               </dd>
             </div>
             <div>
               <dt className="text-xs uppercase tracking-[0.14em] text-ink-soft">Failed searches</dt>
               <dd className="serif text-2xl">
-                <Flap>{String(usage?.failures ?? 0)}</Flap>
+                <Flap>{count(usage?.failures)}</Flap>
               </dd>
             </div>
             <div>
@@ -62,7 +90,12 @@ export default async function SettingsPage() {
           <p className="mt-4 text-ink-soft">
             Credits per search: {config.providerCreditsPerSearch}
           </p>
-          {overBudget ? (
+          {!usageReadable ? (
+            <p className="mt-3 text-ink-soft">
+              We cannot reach the records that hold these figures, so they are not shown rather than
+              shown as zero. Searching live fares does not depend on this.
+            </p>
+          ) : overBudget ? (
             <p className="mt-3 text-drop">
               Projected monthly usage may exceed the configured budget.
             </p>
